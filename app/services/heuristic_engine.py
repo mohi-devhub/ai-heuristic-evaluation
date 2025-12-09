@@ -109,7 +109,7 @@ class HeuristicEvaluationEngine:
     Example Usage:
         engine = HeuristicEvaluationEngine()
         result = await engine.evaluate_interface(detection_result)
-    \"\"\"
+    """
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
