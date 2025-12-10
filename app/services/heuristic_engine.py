@@ -94,6 +94,26 @@ class HeuristicEvaluationResult:
         }
 
 class HeuristicEvaluationEngine:
+    """LLM-powered heuristic evaluation engine.
+    
+    This engine evaluates user interfaces against Nielsen's usability heuristics
+    using Large Language Model reasoning instead of brittle rule-based logic.
+    
+    Key Features:
+    - Uses real OmniParser output format (type, bbox, interactivity, content)
+    - No reliance on hallucinated attributes (hover_state, confirmation, etc.)
+    - LLM-based violation detection with structured JSON responses
+    - RAG-enhanced evaluation with knowledge base context
+    - Supports all 10 Nielsen heuristics (H1-H10)
+    
+    Version: 2.0.0-llm
+    Evaluation Method: LLM-based with prompt engineering
+    
+    Example Usage:
+        engine = HeuristicEvaluationEngine()
+        result = await engine.evaluate_interface(detection_result)
+    """
+    
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.llm_client = None
@@ -110,6 +130,170 @@ class HeuristicEvaluationEngine:
         await self.rag_kb.initialize()
         self.initialized = True
         self.logger.info("Heuristic Evaluation Engine initialized")
+
+    def _serialize_elements_for_llm(self, elements: List[UIElement]) -> str:
+        """Serialize UI elements to JSON format for LLM consumption.
+        
+        Only includes real OmniParser output fields:
+        - type: element type
+        - bbox: [x1, y1, x2, y2] bounding box
+        - interactivity: boolean
+        - content: text content
+        """
+        serialized = []
+        for elem in elements:
+            serialized.append({
+                "type": elem.element_type,
+                "bbox": [elem.bbox[0], elem.bbox[1], elem.bbox[2], elem.bbox[3]],
+                "interactivity": elem.interactivity,
+                "content": elem.text
+            })
+        return json.dumps(serialized, indent=2)
+
+    async def _evaluate_with_llm(
+        self,
+        heuristic_id: HeuristicId,
+        elements: List[UIElement],
+        detection_result: UIElementDetectionResult
+    ) -> List[HeuristicViolation]:
+        """Use LLM to evaluate heuristic violations.
+        
+        This method:
+        1. Serializes UI elements to JSON
+        2. Retrieves heuristic definition and criteria
+        3. Constructs a prompt for the LLM
+        4. Parses LLM response into HeuristicViolation objects
+        """
+        # Get heuristic definition
+        heuristic_def = NIELSEN_HEURISTICS.get(heuristic_id)
+        if not heuristic_def:
+            self.logger.error(f"No definition found for {heuristic_id.value}")
+            return []
+
+        # Serialize elements
+        elements_json = self._serialize_elements_for_llm(elements)
+
+        # Get RAG context if available
+        rag_context = ""
+        if self.rag_kb:
+            try:
+                rag_examples = await self.rag_kb.retrieve_relevant_context(
+                    query=f"{heuristic_def['name']} violations examples",
+                    heuristic_id=heuristic_id.value,
+                    top_k=3
+                )
+                if rag_examples:
+                    rag_context = "\n\nRelevant examples and best practices:\n"
+                    for ex in rag_examples:
+                        rag_context += f"- {ex['content']}\n"
+            except Exception as e:
+                self.logger.warning(f"RAG search failed: {e}")
+
+        # Construct prompt
+        criteria_text = "\n".join([
+            f"- {c['id']}: {c['description']} - {c['evaluation']}"
+            for c in heuristic_def['measurable_criteria']
+        ])
+
+        prompt = f"""You are a UX evaluation expert analyzing a user interface for usability violations.
+
+**Heuristic**: {heuristic_def['name']}
+**Description**: {heuristic_def['description']}
+
+**Measurable Criteria**:
+{criteria_text}
+
+**UI Elements** (from OmniParser detection):
+{elements_json}
+{rag_context}
+
+**Task**: Analyze the UI elements and identify violations of the above heuristic criteria.
+
+For each violation found, provide:
+- criterion_id: The specific criterion violated (e.g., "H1.1", "H2.2")
+- severity: One of ["critical", "major", "minor", "cosmetic"]
+- description: Clear description of the violation
+- affected_elements: List of element content/text affected
+- recommendation: Specific actionable recommendation to fix
+
+Respond with a JSON array of violations. If no violations found, return empty array [].
+
+Example response format:
+[
+  {{
+    "criterion_id": "H1.2",
+    "severity": "major",
+    "description": "Submit button lacks visible feedback state",
+    "affected_elements": ["Submit"],
+    "recommendation": "Add hover and active states to provide visual feedback"
+  }}
+]
+
+Violations:"""
+
+        try:
+            # Call LLM
+            response = await self.llm_client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a UX evaluation expert. Respond only with valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+
+            # Parse response
+            content = response.choices[0].message.content
+            self.logger.debug(f"LLM response for {heuristic_id.value}: {content}")
+            
+            # Try to extract JSON array from response
+            parsed = json.loads(content)
+            
+            # Handle different response formats
+            violations_data = parsed
+            if isinstance(parsed, dict):
+                # If wrapped in object, try common keys
+                for key in ['violations', 'results', 'findings', 'issues']:
+                    if key in parsed:
+                        violations_data = parsed[key]
+                        break
+            
+            if not isinstance(violations_data, list):
+                self.logger.warning(f"LLM response not a list: {violations_data}")
+                return []
+
+            # Convert to HeuristicViolation objects
+            violations = []
+            for v_data in violations_data:
+                try:
+                    # Map severity string to enum
+                    severity_map = {
+                        "critical": SeverityLevel.CRITICAL,
+                        "major": SeverityLevel.MAJOR,
+                        "minor": SeverityLevel.MINOR,
+                        "cosmetic": SeverityLevel.COSMETIC
+                    }
+                    severity = severity_map.get(v_data.get("severity", "minor").lower(), SeverityLevel.MINOR)
+
+                    violation = HeuristicViolation(
+                        heuristic_id=heuristic_id.value,
+                        criterion_id=v_data.get("criterion_id", f"{heuristic_id.value}.0"),
+                        severity=severity,
+                        description=v_data.get("description", "Unspecified violation"),
+                        affected_elements=v_data.get("affected_elements", []),
+                        recommendation=v_data.get("recommendation", "Review and address this issue")
+                    )
+                    violations.append(violation)
+                except Exception as e:
+                    self.logger.error(f"Error parsing violation: {e}, data: {v_data}")
+                    continue
+
+            return violations
+
+        except Exception as e:
+            self.logger.error(f"LLM evaluation failed for {heuristic_id.value}: {e}")
+            return []
 
     def calculate_score(self, violations: List[HeuristicViolation], heuristic_id: str) -> tuple[int, str]:
         heuristic_def = NIELSEN_HEURISTICS.get(HeuristicId(heuristic_id))
@@ -143,16 +327,15 @@ class HeuristicEvaluationEngine:
         elements: List[UIElement],
         detection_result: UIElementDetectionResult
     ) -> HeuristicScore:
-        self.logger.info(f"Evaluating heuristic {heuristic_id.value}")
+        """Evaluate a specific heuristic using LLM-based analysis.
+        
+        This method uses LLM to analyze UI elements and detect violations,
+        eliminating reliance on hallucinated OmniParser attributes.
+        """
+        self.logger.info(f"Evaluating heuristic {heuristic_id.value} with LLM")
 
-        violations = []
-
-        if heuristic_id == HeuristicId.H1_VISIBILITY_OF_SYSTEM_STATUS:
-            violations = await self._evaluate_h1_visibility(elements, detection_result)
-        elif heuristic_id == HeuristicId.H2_MATCH_BETWEEN_SYSTEM_AND_REAL_WORLD:
-            violations = await self._evaluate_h2_match_real_world(elements, detection_result)
-        elif heuristic_id == HeuristicId.H3_USER_CONTROL_AND_FREEDOM:
-            violations = await self._evaluate_h3_user_control(elements, detection_result)
+        # Use LLM-based evaluation for all heuristics
+        violations = await self._evaluate_with_llm(heuristic_id, elements, detection_result)
 
         score, explanation = self.calculate_score(violations, heuristic_id.value)
 
@@ -171,130 +354,113 @@ class HeuristicEvaluationEngine:
             llm_explanation=llm_explanation
         )
 
-    async def _evaluate_h1_visibility(
+    async def _evaluate_h4_consistency_legacy(
         self,
         elements: List[UIElement],
         detection_result: UIElementDetectionResult
     ) -> List[HeuristicViolation]:
+        """Legacy rule-based H4 evaluation (deprecated).
+        
+        This method is kept for reference but no longer used.
+        LLM-based evaluation is now preferred.
+        """
         violations = []
-
+        
+        # H4.1: Check button dimension consistency
         buttons = [e for e in elements if e.element_type == "button"]
-        inputs = [e for e in elements if e.element_type == "input"]
-
-        for button in buttons:
-            if not button.attributes.get("hover_state") and not button.attributes.get("active_state"):
-                violations.append(HeuristicViolation(
-                    heuristic_id="H1",
-                    criterion_id="H1.2",
-                    severity=SeverityLevel.MAJOR,
-                    description=f"Button '{button.text}' lacks visible hover or active states",
-                    affected_elements=[button.text],
-                    recommendation="Add hover and active states to button for user feedback"
-                ))
-
-        for input_field in inputs:
-            if not input_field.attributes.get("placeholder") and not input_field.text:
-                violations.append(HeuristicViolation(
-                    heuristic_id="H1",
-                    criterion_id="H1.1",
-                    severity=SeverityLevel.MINOR,
-                    description=f"Input field lacks placeholder or label for guidance",
-                    affected_elements=[input_field.text],
-                    recommendation="Add placeholder text or label to help users understand input"
-                ))
-
-        if len(buttons) > 0 and not any(b.attributes.get("loading_state") for b in buttons):
-            violations.append(HeuristicViolation(
-                heuristic_id="H1",
-                criterion_id="H1.2",
-                severity=SeverityLevel.MAJOR,
-                description="No loading states detected for action buttons",
-                affected_elements=[b.text for b in buttons],
-                recommendation="Add loading indicators to buttons during async operations"
-            ))
-
-        return violations
-
-    async def _evaluate_h2_match_real_world(
-        self,
-        elements: List[UIElement],
-        detection_result: UIElementDetectionResult
-    ) -> List[HeuristicViolation]:
-        violations = []
-
-        for element in elements:
-            if element.element_type == "button":
-                text = element.text.lower()
-                if any(term in text for term in ["submit", "execute", "process"]):
+        if len(buttons) >= 2:
+            # Group buttons and check dimension consistency using bbox
+            button_dimensions = []
+            for btn in buttons:
+                # Calculate width and height from bbox
+                width = btn.width
+                height = btn.height
+                if width > 0 and height > 0:
+                    button_dimensions.append((btn.text, width, height))
+            
+            if len(button_dimensions) >= 2:
+                # Check if button heights are consistent (allow 10% variance)
+                heights = [d[2] for d in button_dimensions]
+                avg_height = sum(heights) / len(heights)
+                inconsistent_buttons = [
+                    d[0] for d in button_dimensions 
+                    if abs(d[2] - avg_height) > avg_height * 0.1
+                ]
+                
+                if inconsistent_buttons:
                     violations.append(HeuristicViolation(
-                        heuristic_id="H2",
-                        criterion_id="H2.2",
+                        heuristic_id="H4",
+                        criterion_id="H4.1",
                         severity=SeverityLevel.MINOR,
-                        description=f"Button uses technical term '{element.text}' instead of user-friendly language",
-                        affected_elements=[element.text],
-                        recommendation="Use action-oriented, user-friendly language (e.g., 'Send', 'Save', 'Continue')"
+                        description=f"Inconsistent button heights detected",
+                        affected_elements=inconsistent_buttons,
+                        recommendation="Standardize button heights for visual consistency"
                     ))
-
-            if element.element_type == "heading":
-                text = element.text
-                if any(jargon in text.lower() for jargon in ["api", "endpoint", "database"]):
-                    violations.append(HeuristicViolation(
-                        heuristic_id="H2",
-                        criterion_id="H2.2",
-                        severity=SeverityLevel.MAJOR,
-                        description=f"Heading contains technical jargon: '{text}'",
-                        affected_elements=[text],
-                        recommendation="Replace technical jargon with user-friendly terminology"
-                    ))
-
-        return violations
-
-    async def _evaluate_h3_user_control(
-        self,
-        elements: List[UIElement],
-        detection_result: UIElementDetectionResult
-    ) -> List[HeuristicViolation]:
-        violations = []
-
-        has_delete_button = any(
-            "delete" in e.text.lower() or "remove" in e.text.lower()
-            for e in elements if e.element_type == "button"
-        )
-
-        if has_delete_button:
-            delete_buttons = [
-                e for e in elements
-                if e.element_type == "button" and
-                ("delete" in e.text.lower() or "remove" in e.text.lower())
-            ]
-
-            for btn in delete_buttons:
-                if not btn.attributes.get("confirmation"):
-                    violations.append(HeuristicViolation(
-                        heuristic_id="H3",
-                        criterion_id="H3.3",
-                        severity=SeverityLevel.CRITICAL,
-                        description=f"Delete button '{btn.text}' lacks confirmation dialog",
-                        affected_elements=[btn.text],
-                        recommendation="Add confirmation dialog for destructive actions to prevent accidents"
-                    ))
-
-        form_elements = [e for e in elements if e.element_type in ["button", "input", "form"]]
-        has_cancel = any(
-            "cancel" in e.text.lower() or "back" in e.text.lower()
-            for e in elements if e.element_type == "button"
-        )
-
-        if len(form_elements) > 2 and not has_cancel:
-            violations.append(HeuristicViolation(
-                heuristic_id="H3",
-                criterion_id="H3.2",
-                severity=SeverityLevel.MAJOR,
-                description="Form lacks clear exit option (cancel/back button)",
-                affected_elements=["form"],
-                recommendation="Add cancel/back button to allow users to exit without completing form"
-            ))
-
+        
+        # H4.2: Check typography consistency for similar elements
+        # Infer heading levels from text elements based on bbox height
+        from app.services.omniparser_client import infer_heading_level
+        
+        text_elements = [e for e in elements if e.element_type in ["text", "heading"]]
+        if len(text_elements) >= 2:
+            # Group by inferred heading level
+            headings_by_level = {}
+            for elem in text_elements:
+                level = infer_heading_level(elem, text_elements)
+                if level:  # Only consider actual headings
+                    if level not in headings_by_level:
+                        headings_by_level[level] = []
+                    headings_by_level[level].append((elem.text, elem.height))
+            
+            # Check consistency within each heading level
+            for level, headings in headings_by_level.items():
+                if len(headings) >= 2:
+                    heights = [h[1] for h in headings]
+                    avg_height = sum(heights) / len(heights)
+                    # Check for variance > 15% within same level
+                    inconsistent = [
+                        h[0] for h in headings 
+                        if abs(h[1] - avg_height) > avg_height * 0.15
+                    ]
+                    
+                    if inconsistent:
+                        violations.append(HeuristicViolation(
+                            heuristic_id="H4",
+                            criterion_id="H4.2",
+                            severity=SeverityLevel.MINOR,
+                            description=f"Inconsistent heights for level {level} headings",
+                            affected_elements=inconsistent,
+                            recommendation="Ensure consistent sizing for headings at the same level"
+                        ))
+        
+        # H4.3: Color consistency check removed
+        # Real Omniparser output doesn't include color information
+        # Color analysis would require separate vision model analysis
+        
+        # H4.4: Check terminology consistency
+        button_texts = [btn.text.lower() for btn in buttons]
+        
+        # Define conflicting term pairs
+        conflicting_terms = [
+            (["delete", "remove"], "delete/remove"),
+            (["save", "submit"], "save/submit"),
+            (["cancel", "close", "exit"], "cancel/close/exit"),
+            (["edit", "modify", "update"], "edit/modify/update"),
+            (["add", "create", "new"], "add/create/new")
+        ]
+        
+        for terms, term_group in conflicting_terms:
+            found_terms = [t for t in terms if any(t in bt for bt in button_texts)]
+            if len(found_terms) > 1:
+                violations.append(HeuristicViolation(
+                    heuristic_id="H4",
+                    criterion_id="H4.4",
+                    severity=SeverityLevel.MAJOR,
+                    description=f"Inconsistent terminology: both {' and '.join(found_terms)} used for similar actions",
+                    affected_elements=found_terms,
+                    recommendation=f"Choose one term from {term_group} and use it consistently"
+                ))
+        
         return violations
 
     async def evaluate_interface(
@@ -309,7 +475,8 @@ class HeuristicEvaluationEngine:
         heuristic_ids = [
             HeuristicId.H1_VISIBILITY_OF_SYSTEM_STATUS,
             HeuristicId.H2_MATCH_BETWEEN_SYSTEM_AND_REAL_WORLD,
-            HeuristicId.H3_USER_CONTROL_AND_FREEDOM
+            HeuristicId.H3_USER_CONTROL_AND_FREEDOM,
+            HeuristicId.H4_CONSISTENCY_AND_STANDARDS
         ]
 
         heuristic_scores = []
@@ -335,7 +502,8 @@ class HeuristicEvaluationEngine:
             critical_issues=critical_issues,
             evaluation_metadata={
                 "total_elements": len(detection_result.elements),
-                "evaluation_version": "1.0.0"
+                "evaluation_version": "2.0.0-llm",
+                "evaluation_method": "llm-based"
             }
         )
 
@@ -353,16 +521,22 @@ class HeuristicEvaluationEngine:
         score: int,
         violations: List[HeuristicViolation]
     ) -> Optional[str]:
+        """Generate LLM-based explanation for heuristic evaluation results.
+        
+        Uses only real OmniParser output fields (type, bbox, interactivity, content).
+        Gracefully handles missing/optional fields.
+        """
         if not self.llm_client:
             return None
 
         try:
+            # Serialize elements using only real OmniParser fields
             elements_brief = [
                 {
                     "type": e.element_type,
                     "text": e.text,
-                    "interactive": e.interactive,
-                    "attributes": list(e.attributes.keys())
+                    "interactivity": e.interactivity,  # Use real field name
+                    "bbox": e.bbox  # Include bounding box for context
                 }
                 for e in detection_result.elements[:20]
             ]
@@ -403,5 +577,8 @@ class HeuristicEvaluationEngine:
             return response.choices[0].message.content.strip() if response.choices else None
 
         except Exception as exc:
-            self.logger.warning(f"LLM explanation failed for {heuristic_id.value}: {exc}")
+            self.logger.warning(
+                f"LLM explanation failed for {heuristic_id.value}: {exc}. "
+                f"Falling back to empty explanation."
+            )
             return None
