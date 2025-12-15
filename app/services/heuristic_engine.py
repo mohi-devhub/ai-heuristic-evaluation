@@ -231,6 +231,16 @@ Example response format:
 
 Violations:"""
 
+        # Enforce RAG usage if context exists
+        if rag_context:
+            prompt += """
+
+IMPORTANT INSTRUCTION:
+You have access to "Relevant examples and best practices" above (from the RAG Knowledge Base).
+1. If a violation matches a provided example validation, you MUST cite the example source in your 'recommendation'.
+2. Format citations as: "Recommendation text... (Ref: [Source Name/Pattern])"
+"""
+
         try:
             # Call LLM
             response = await self.llm_client.chat.completions.create(
@@ -293,7 +303,7 @@ Violations:"""
 
         except Exception as e:
             self.logger.error(f"LLM evaluation failed for {heuristic_id.value}: {e}")
-            return []
+            raise ValueError(f"AI Service Unavailable: {str(e)}")
 
     def calculate_score(self, violations: List[HeuristicViolation], heuristic_id: str) -> tuple[int, str]:
         heuristic_def = NIELSEN_HEURISTICS.get(HeuristicId(heuristic_id))
