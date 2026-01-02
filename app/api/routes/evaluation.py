@@ -4,7 +4,8 @@ from typing import Optional, List
 import json
 
 from app.services.heuristic_engine import HeuristicEvaluationEngine
-from app.core.config import settings
+from app.core.config import settings, ALLOWED_IMAGE_TYPES
+from app.services.exceptions import InvalidInputError
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -31,6 +32,25 @@ async def evaluate_heuristics(
         500: Unexpected server error
     """
     try:
+        # Validate file exists
+        if not image:
+            raise InvalidInputError(
+                message="No image file provided",
+                details={"field": "image"}
+            )
+        
+        # Validate content type
+        content_type = image.content_type or "application/octet-stream"
+        if content_type not in ALLOWED_IMAGE_TYPES:
+            allowed = ", ".join(sorted(ALLOWED_IMAGE_TYPES))
+            raise InvalidInputError(
+                message=f"Unsupported image type: {content_type}. Allowed types: {allowed}",
+                details={
+                    "received": content_type,
+                    "allowed_types": list(ALLOWED_IMAGE_TYPES)
+                }
+            )
+        
         # Use singleton OmniParser client from app.state (avoids re-initializing model)
         detection_client = request.app.state.omniparser_client
         contents = await image.read()
