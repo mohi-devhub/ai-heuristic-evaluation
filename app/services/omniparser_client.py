@@ -182,9 +182,13 @@ class OmniParserClient:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.model_loaded = False
+        self.caption_model = None  # Florence-2 model for captioning
 
     async def initialize(self):
         self.logger.info("Initializing OmniParser client...")
+        # Initialize Florence-2 caption model
+        # In production, this would load the actual model
+        self.caption_model = "florence-2-base"  # Placeholder
         self.model_loaded = True
         self.logger.info("OmniParser client initialized successfully")
 
@@ -318,6 +322,45 @@ class OmniParserClient:
                 message="Failed to detect UI elements",
                 details={"error": str(e)}
             )
+
+    def _map_element_type(self, raw_type: str) -> str:
+        """Map raw element type from Florence-2 to standardized type.
+        
+        Florence-2 may return various type strings that need to be normalized
+        to our standard element types.
+        
+        Args:
+            raw_type: Raw type string from Florence-2
+            
+        Returns:
+            Standardized element type
+        """
+        type_mapping = {
+            "btn": "button",
+            "submit": "button",
+            "reset": "button",
+            "textbox": "input",
+            "textarea": "input",
+            "textfield": "input",
+            "select": "input",
+            "dropdown": "input",
+            "link": "text",
+            "a": "text",
+            "label": "text",
+            "heading": "text",
+            "h1": "text",
+            "h2": "text",
+            "h3": "text",
+            "h4": "text",
+            "h5": "text",
+            "h6": "text",
+            "p": "text",
+            "span": "text",
+            "div": "text"
+        }
+        
+        normalized = raw_type.lower().strip()
+        return type_mapping.get(normalized, normalized)
 
     def group_related_elements(self, elements: List[UIElement]) -> Dict[str, List[UIElement]]:
         grouped = {

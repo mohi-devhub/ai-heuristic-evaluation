@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, HTTPException, UploadFile, File, Body
+from fastapi import APIRouter, HTTPException, UploadFile, File, Body, Request
 from typing import Optional, List
 import json
 
@@ -18,6 +18,7 @@ router = APIRouter()
 
 @router.post("/evaluate")
 async def evaluate_heuristics(
+    request: Request,
     image: UploadFile = File(...),
     include_llm_analysis: bool = True
 ):
@@ -60,9 +61,8 @@ async def evaluate_heuristics(
         # Read image data
         contents = await image.read()
         
-        # Initialize OmniParser and detect elements
-        detection_client = OmniParserClient()
-        await detection_client.initialize()
+        # Use singleton OmniParser client from app.state (avoids re-initializing model)
+        detection_client = request.app.state.omniparser_client
         
         # Pass content_type for validation
         detection_result = await detection_client.detect_elements(
